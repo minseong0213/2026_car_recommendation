@@ -1,0 +1,14 @@
+__pycache__/
+*.py[cod]
+.python-version
+.venv/
+venv/
+env/
+.env
+.DS_Store
+Thumbs.db
+
+# Superseded GPS-altitude grade artifacts. Current grade analysis is OBD-only.
+outputs/**/altitude_points.csv
+outputs/**/grade_grid_20m.csv
+outputs/**/grade_segments.csv
