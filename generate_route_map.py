@@ -42,6 +42,8 @@ GRADE_COLORS = {
     "normal_load": "#16A34A",
     "downhill_or_coast_possible": "#2563EB",
     "transition_load": "#8B5CF6",
+    "stop_or_idle": "#475569",
+    "sensor_unavailable": "#9CA3AF",
     "non_analyzed": "#9CA3AF",
     "unknown": "#6B7280",
 }
@@ -51,7 +53,9 @@ GRADE_LABELS = {
     "mild_uphill_or_external_load": "약한 오르막/외부부하",
     "normal_load": "평지 기대부하 근접",
     "downhill_or_coast_possible": "내리막/타행 가능",
-    "transition_load": "전환 부하",
+    "transition_load": "부하 전환/중간 편차",
+    "stop_or_idle": "정차/초저속",
+    "sensor_unavailable": "센서값 부족",
     "non_analyzed": "분석 제외",
     "unknown": "미상",
 }
@@ -141,13 +145,19 @@ def load_grade_timeseries(grade_path: Path) -> pd.DataFrame:
 
     grade = pd.read_csv(grade_path, encoding="utf-8-sig")
     grade["second"] = pd.to_numeric(grade["time_s"], errors="coerce").round().astype("Int64")
-    keep_cols = [
+    candidate_cols = [
         "second",
         "obd_grade_class",
         "power_load_deviation_pp",
         "equivalent_grade_index_pct",
         "is_analyzable_quasi_cruise",
+        "primary_motion_state",
+        "cruise_speed_band",
+        "v5_segment",
+        "load_deviation_class",
+        "grade_confidence",
     ]
+    keep_cols = [column for column in candidate_cols if column in grade.columns]
     grade = grade.dropna(subset=["second"])[keep_cols].copy()
     grade["second"] = grade["second"].astype(int)
     grade["obd_grade_class"] = grade["obd_grade_class"].fillna("non_analyzed")
@@ -317,7 +327,9 @@ def write_static_preview(
         "mild_uphill_or_external_load": "mild uphill/load",
         "normal_load": "normal load",
         "downhill_or_coast_possible": "downhill/coast",
-        "transition_load": "transition",
+        "transition_load": "load transition",
+        "stop_or_idle": "stop/idle",
+        "sensor_unavailable": "sensor unavailable",
         "non_analyzed": "not analyzed",
         "stop": "stop",
         "low": "low 2-40km/h",
@@ -325,7 +337,7 @@ def write_static_preview(
         "high": "high 80km/h+",
     }
     static_title = (
-        "OBD-only grade/load route map"
+        "V5 3-stage OBD-only grade/load route map"
         if "strong_uphill_or_external_load" in colors
         else "Drive Route Preview"
     )
@@ -526,10 +538,11 @@ def main() -> None:
             "normal_load",
             "downhill_or_coast_possible",
             "transition_load",
-            "non_analyzed",
+            "stop_or_idle",
+            "sensor_unavailable",
         ]
-        title = "OBD-only 경사/외부부하 지도"
-        subtitle = "GPS는 위치 표시만 사용, 경사 판정은 차량속도+엔진부하 기반"
+        title = "V5 3단계 OBD-only 경사/외부부하 지도"
+        subtitle = "GPS는 위치 표시만 사용, 1차/2차 주행상태 위에 3차 엔진부하 편차를 오버레이"
         band_col = "map_band"
     else:
         route["map_band"] = route["band"]

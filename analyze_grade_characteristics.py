@@ -76,8 +76,24 @@ def clock_label(clock_start: pd.Timestamp, seconds: float) -> str:
     return (clock_start + pd.to_timedelta(float(seconds), unit="s")).strftime("%H:%M:%S")
 
 
+def sustained_mask(condition: pd.Series, min_samples: int) -> pd.Series:
+    """True 상태가 지정 샘플 수 이상 이어진 구간만 True로 남긴다."""
+
+    run_id = condition.ne(condition.shift(fill_value=False)).cumsum()
+    run_len = condition.groupby(run_id).transform("size")
+    return condition & (run_len >= min_samples)
+
+
+def most_common(series: pd.Series) -> Any:
+    values = series.dropna()
+    if values.empty:
+        return None
+    mode = values.mode()
+    return mode.iloc[0] if not mode.empty else values.iloc[0]
+
+
 def analyze_obd_grade(ts: pd.DataFrame) -> pd.DataFrame:
-    """V5 S4 기반 부하 편차와 경사/외부부하 클래스를 계산한다."""
+    """V5 1/2/3차 구조로 주행상태와 경사/외부부하 클래스를 계산한다."""
 
     dt = ts["time_s"].diff().fillna(1.0).clip(lower=0.1, upper=3.0)
     smooth_speed = ts["speed_mps"].rolling(3, center=True, min_periods=1).mean()
@@ -96,37 +112,84 @@ def analyze_obd_grade(ts: pd.DataFrame) -> pd.DataFrame:
         result["engine_load_pct"] - result["required_load_pct"]
     )
 
-    quasi_cruise = (
+    has_motion_signal = result["speed_kmh"].notna()
+    stop_candidate = has_motion_signal & (result["speed_kmh"] < 2.0)
+    accel_candidate = has_motion_signal & (result["accel_mps2"] > 0.3)
+    decel_candidate = has_motion_signal & (result["accel_mps2"] < -0.3)
+    cruise_candidate = (
+        has_motion_signal
+        & (result["speed_kmh"] >= 2.0)
+        & (result["accel_mps2"].abs() <= 0.3)
+    )
+
+    stop_state = sustained_mask(stop_candidate, 5)
+    accel_state = sustained_mask(accel_candidate, 2)
+    decel_state = sustained_mask(decel_candidate, 2)
+
+    result["primary_motion_state"] = "transition"
+    result.loc[~has_motion_signal, "primary_motion_state"] = "sensor_unavailable"
+    result.loc[cruise_candidate, "primary_motion_state"] = "cruise"
+    result.loc[accel_state, "primary_motion_state"] = "acceleration"
+    result.loc[decel_state, "primary_motion_state"] = "deceleration"
+    result.loc[stop_state, "primary_motion_state"] = "stop"
+
+    result["cruise_speed_band"] = ""
+    result.loc[cruise_candidate & (result["speed_kmh"] < 40), "cruise_speed_band"] = (
+        "low_cruise"
+    )
+    result.loc[
+        cruise_candidate & (result["speed_kmh"] >= 40) & (result["speed_kmh"] < 80),
+        "cruise_speed_band",
+    ] = "mid_cruise"
+    result.loc[cruise_candidate & (result["speed_kmh"] >= 80), "cruise_speed_band"] = (
+        "high_cruise"
+    )
+
+    result["v5_segment"] = result["primary_motion_state"]
+    cruise_segment = result["cruise_speed_band"] != ""
+    result.loc[cruise_segment, "v5_segment"] = result.loc[cruise_segment, "cruise_speed_band"]
+
+    stable_cruise_for_grade = (
         (result["speed_kmh"] >= 2.0)
         & (result["accel_mps2"].abs() <= 0.3)
         & result["engine_load_pct"].notna()
     )
-    run_id = quasi_cruise.ne(quasi_cruise.shift(fill_value=False)).cumsum()
-    run_len = quasi_cruise.groupby(run_id).transform("size")
-    result["is_analyzable_quasi_cruise"] = quasi_cruise & (run_len >= 3)
+    result["is_analyzable_quasi_cruise"] = sustained_mask(stable_cruise_for_grade, 3)
 
     dev = result["power_load_deviation_pp"]
-    result["obd_grade_class"] = "non_analyzed"
-    result.loc[result["is_analyzable_quasi_cruise"] & (dev >= 15), "obd_grade_class"] = (
+    has_load_deviation = (
+        (result["speed_kmh"] >= 2.0)
+        & result["engine_load_pct"].notna()
+        & dev.notna()
+    )
+
+    result["load_deviation_class"] = "load_not_available"
+    result.loc[has_load_deviation, "load_deviation_class"] = "transition_load"
+    result.loc[has_load_deviation & (dev >= 15), "load_deviation_class"] = (
         "strong_uphill_or_external_load"
     )
     result.loc[
-        result["is_analyzable_quasi_cruise"] & (dev >= 10) & (dev < 15),
-        "obd_grade_class",
+        has_load_deviation & (dev >= 10) & (dev < 15),
+        "load_deviation_class",
     ] = "mild_uphill_or_external_load"
     result.loc[
-        result["is_analyzable_quasi_cruise"] & (dev <= -8),
-        "obd_grade_class",
+        has_load_deviation & (dev <= -8),
+        "load_deviation_class",
     ] = "downhill_or_coast_possible"
     result.loc[
-        result["is_analyzable_quasi_cruise"] & (dev.abs() <= 5),
-        "obd_grade_class",
+        has_load_deviation & (dev.abs() <= 5),
+        "load_deviation_class",
     ] = "normal_load"
-    result.loc[
-        result["is_analyzable_quasi_cruise"]
-        & (result["obd_grade_class"] == "non_analyzed"),
-        "obd_grade_class",
-    ] = "transition_load"
+
+    result["grade_confidence"] = "not_applicable"
+    result.loc[has_load_deviation, "grade_confidence"] = "low"
+    result.loc[result["is_analyzable_quasi_cruise"], "grade_confidence"] = "high"
+
+    result["obd_grade_class"] = result["load_deviation_class"]
+    result.loc[stop_candidate, "obd_grade_class"] = "stop_or_idle"
+    result.loc[~has_motion_signal | result["engine_load_pct"].isna(), "obd_grade_class"] = (
+        "sensor_unavailable"
+    )
 
     # V5 근거: 5% 경사에서 평지 대비 약 +15~20pp 부하 증가.
     # 정확한 경사도라기보다 equivalent grade index로만 사용한다.
@@ -142,11 +205,18 @@ def summarize(analyzed: pd.DataFrame) -> dict[str, Any]:
     moving_seconds = int(moving.sum())
     moving_distance_m = float(analyzed.loc[moving, "distance_step_m"].sum())
     analyzable = analyzed[analyzed["is_analyzable_quasi_cruise"]].copy()
+    mapped = analyzed[analyzed["obd_grade_class"] != "sensor_unavailable"].copy()
+    low_confidence = analyzed[analyzed["grade_confidence"] == "low"].copy()
 
-    class_summary = {}
-    if not analyzable.empty:
+    def build_class_summary(
+        frame: pd.DataFrame,
+        ratio_suffix: str,
+    ) -> dict[str, Any]:
+        class_summary: dict[str, Any] = {}
+        if frame.empty:
+            return class_summary
         grouped = (
-            analyzable.groupby("obd_grade_class")
+            frame.groupby("obd_grade_class")
             .agg(
                 seconds=("obd_grade_class", "size"),
                 distance_m=("distance_step_m", "sum"),
@@ -158,25 +228,42 @@ def summarize(analyzed: pd.DataFrame) -> dict[str, Any]:
                 deviation_median_pp=("power_load_deviation_pp", "median"),
                 deviation_p90_pp=("power_load_deviation_pp", lambda s: s.quantile(0.90)),
                 equivalent_grade_index_mean_pct=("equivalent_grade_index_pct", "mean"),
+                high_confidence_seconds=(
+                    "grade_confidence",
+                    lambda s: int((s == "high").sum()),
+                ),
+                low_confidence_seconds=(
+                    "grade_confidence",
+                    lambda s: int((s == "low").sum()),
+                ),
             )
             .reset_index()
         )
         for row in grouped.to_dict(orient="records"):
-            row["time_ratio_of_analyzable"] = row["seconds"] / max(len(analyzable), 1)
-            row["distance_ratio_of_analyzable"] = row["distance_m"] / max(
-                float(analyzable["distance_step_m"].sum()), 1e-9
+            row[f"time_ratio_of_{ratio_suffix}"] = row["seconds"] / max(len(frame), 1)
+            row[f"distance_ratio_of_{ratio_suffix}"] = row["distance_m"] / max(
+                float(frame["distance_step_m"].sum()), 1e-9
             )
             class_summary[row["obd_grade_class"]] = row
+        return class_summary
 
     return {
-        "method": "OBD-only V5 S4 power_load_deviation",
+        "method": "OBD-only V5 3-stage motion + S4 power_load_deviation",
         "gps_used_for_grade": False,
         "total_seconds": total_seconds,
         "moving_seconds": moving_seconds,
         "moving_distance_m_by_obd_speed": moving_distance_m,
+        "mapped_grade_seconds": int(len(mapped)),
+        "mapped_grade_distance_m": float(mapped["distance_step_m"].sum())
+        if not mapped.empty
+        else 0.0,
         "analyzable_quasi_cruise_seconds": int(len(analyzable)),
         "analyzable_quasi_cruise_distance_m": float(analyzable["distance_step_m"].sum())
         if not analyzable.empty
+        else 0.0,
+        "low_confidence_grade_seconds": int(len(low_confidence)),
+        "low_confidence_grade_distance_m": float(low_confidence["distance_step_m"].sum())
+        if not low_confidence.empty
         else 0.0,
         "mean_power_load_deviation_pp": float(analyzable["power_load_deviation_pp"].mean())
         if not analyzable.empty
@@ -187,7 +274,8 @@ def summarize(analyzed: pd.DataFrame) -> dict[str, Any]:
         "p90_power_load_deviation_pp": float(analyzable["power_load_deviation_pp"].quantile(0.90))
         if not analyzable.empty
         else None,
-        "class_summary": class_summary,
+        "class_summary": build_class_summary(analyzable, "analyzable"),
+        "map_class_summary": build_class_summary(mapped, "mapped"),
     }
 
 
@@ -224,6 +312,10 @@ def run_summary(part: pd.DataFrame, grade_class: str, clock_start: pd.Timestamp)
         "required_load_avg_pct": float(part["required_load_pct"].mean()),
         "deviation_mean_pp": float(part["power_load_deviation_pp"].mean()),
         "equivalent_grade_index_mean_pct": float(part["equivalent_grade_index_pct"].mean()),
+        "grade_confidence": most_common(part["grade_confidence"])
+        if "grade_confidence" in part
+        else None,
+        "v5_segment": most_common(part["v5_segment"]) if "v5_segment" in part else None,
     }
 
 
@@ -234,15 +326,33 @@ def write_report(
 ) -> Path:
     report_path = output_dir / "grade_analysis_report.md"
     class_summary = summary["class_summary"]
+    map_class_summary = summary.get("map_class_summary", {})
 
-    def line(key: str, label: str) -> str:
-        row = class_summary.get(key)
+    def fmt_pp(value: Any) -> str:
+        if value is None or pd.isna(value):
+            return "n/a"
+        return f"{float(value):.1f}pp"
+
+    def fmt_pct(value: Any) -> str:
+        if value is None or pd.isna(value):
+            return "n/a"
+        return f"{float(value):.1%}"
+
+    def line(table: dict[str, Any], key: str, label: str, ratio_key: str) -> str:
+        row = table.get(key)
         if row is None:
             return f"- {label}: 0초, 0m"
+        ratio = row.get(ratio_key)
+        confidence = ""
+        if "high_confidence_seconds" in row or "low_confidence_seconds" in row:
+            confidence = (
+                f", 고신뢰 {row.get('high_confidence_seconds', 0):.0f}초"
+                f"/저신뢰 {row.get('low_confidence_seconds', 0):.0f}초"
+            )
         return (
             f"- {label}: {row['seconds']:.0f}초, {row['distance_m']:.0f}m "
-            f"({row['distance_ratio_of_analyzable']:.1%}), "
-            f"평균 편차 {row['deviation_mean_pp']:.1f}pp"
+            f"({fmt_pct(ratio)}), 평균 편차 {fmt_pp(row['deviation_mean_pp'])}"
+            f"{confidence}"
         )
 
     significant = runs[
@@ -258,26 +368,41 @@ def write_report(
         significant = significant.sort_values("deviation_mean_pp", ascending=False).head(8)
 
     lines = [
-        "# OBD-only 경사/외부부하 분석",
+        "# V5 3단계 OBD-only 경사/외부부하 분석",
         "",
         "- 사용 데이터: 차량속도, 엔진부하, RPM, MAF, 시간",
         "- 미사용 데이터: GPS 위도, GPS 경도, GPS 고도",
-        "- 기준: V5 S4 `actual_engine_load - required_load(speed)`",
+        "- 기준: V5 1차 운동상태 → 2차 순항 세분화 → 3차 S4 부하편차",
+        "- 지도 표시는 1차에서 탈락시킨 결과가 아니라, 이동 중 부하편차를 함께 오버레이한 결과이다.",
+        "- 고신뢰 경사 판정: 속도 2km/h 이상, abs(a) ≤ 0.3m/s², 3초 이상 준정속",
+        "- 저신뢰 부하 참고: 가속/감속/전환 중 부하편차가 큰 구간",
         "",
         f"- 전체 시간: {summary['total_seconds']}초",
         f"- 이동 시간: {summary['moving_seconds']}초",
-        f"- 분석 가능 준정속 구간: {summary['analyzable_quasi_cruise_seconds']}초, "
+        f"- 지도 표시 가능 구간: {summary['mapped_grade_seconds']}초, "
+        f"{summary['mapped_grade_distance_m']:.0f}m",
+        f"- 고신뢰 준정속 구간: {summary['analyzable_quasi_cruise_seconds']}초, "
         f"{summary['analyzable_quasi_cruise_distance_m']:.0f}m",
-        f"- 준정속 평균 부하 편차: {summary['mean_power_load_deviation_pp']:.1f}pp",
-        f"- 준정속 중앙 부하 편차: {summary['median_power_load_deviation_pp']:.1f}pp",
-        f"- 준정속 P90 부하 편차: {summary['p90_power_load_deviation_pp']:.1f}pp",
+        f"- 저신뢰 부하 참고 구간: {summary['low_confidence_grade_seconds']}초, "
+        f"{summary['low_confidence_grade_distance_m']:.0f}m",
+        f"- 고신뢰 준정속 평균 부하 편차: {fmt_pp(summary['mean_power_load_deviation_pp'])}",
+        f"- 고신뢰 준정속 중앙 부하 편차: {fmt_pp(summary['median_power_load_deviation_pp'])}",
+        f"- 고신뢰 준정속 P90 부하 편차: {fmt_pp(summary['p90_power_load_deviation_pp'])}",
         "",
-        "## 부하 클래스 비중",
-        line("strong_uphill_or_external_load", "강한 오르막/외부부하 플래그"),
-        line("mild_uphill_or_external_load", "약한 오르막/외부부하 플래그"),
-        line("normal_load", "평지 기대부하 근접"),
-        line("downhill_or_coast_possible", "내리막/타행 가능"),
-        line("transition_load", "전환 부하"),
+        "## 지도 표시 부하 클래스 비중",
+        line(map_class_summary, "strong_uphill_or_external_load", "강한 오르막/외부부하 플래그", "distance_ratio_of_mapped"),
+        line(map_class_summary, "mild_uphill_or_external_load", "약한 오르막/외부부하 플래그", "distance_ratio_of_mapped"),
+        line(map_class_summary, "normal_load", "평지 기대부하 근접", "distance_ratio_of_mapped"),
+        line(map_class_summary, "downhill_or_coast_possible", "내리막/타행 가능", "distance_ratio_of_mapped"),
+        line(map_class_summary, "transition_load", "부하 전환/중간 편차", "distance_ratio_of_mapped"),
+        line(map_class_summary, "stop_or_idle", "정차/초저속", "distance_ratio_of_mapped"),
+        "",
+        "## 고신뢰 준정속 부하 클래스 비중",
+        line(class_summary, "strong_uphill_or_external_load", "강한 오르막/외부부하 플래그", "distance_ratio_of_analyzable"),
+        line(class_summary, "mild_uphill_or_external_load", "약한 오르막/외부부하 플래그", "distance_ratio_of_analyzable"),
+        line(class_summary, "normal_load", "평지 기대부하 근접", "distance_ratio_of_analyzable"),
+        line(class_summary, "downhill_or_coast_possible", "내리막/타행 가능", "distance_ratio_of_analyzable"),
+        line(class_summary, "transition_load", "부하 전환/중간 편차", "distance_ratio_of_analyzable"),
         "",
         "## 주요 오르막/외부부하 의심 구간",
     ]
@@ -289,7 +414,8 @@ def write_report(
                 f"- {row.start_clock}~{row.end_clock}: {row.seconds}초, "
                 f"{row.distance_m:.0f}m, 평균속도 {row.speed_avg_kmh:.1f}km/h, "
                 f"부하편차 {row.deviation_mean_pp:.1f}pp, "
-                f"등가 경사 지수 {row.equivalent_grade_index_mean_pct:.1f}%"
+                f"등가 경사 지수 {row.equivalent_grade_index_mean_pct:.1f}%, "
+                f"신뢰도 {row.grade_confidence}, V5구간 {row.v5_segment}"
             )
 
     lines.extend(

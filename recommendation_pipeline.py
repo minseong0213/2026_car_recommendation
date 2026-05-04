@@ -61,6 +61,21 @@ CSV_COL = {
     "lon": "Longtitude",
 }
 
+CSV_ALIASES = {
+    "time": ["time", "timestamp", "Timestamp", "시간"],
+    "obd_speed": ["차량 속도 (km/h)", "obd_speed_kph", "obd_speed_kmh"],
+    "gps_speed": ["속도 (GPS) (km/h)", "gps_speed_kph", "gps_speed_kmh"],
+    "rpm": ["엔진 RPM (rpm)", "rpm", "RPM"],
+    "throttle": ["스로틀 위치 (%)", "throttle_pct", "Throttle Position (%)"],
+    "engine_load": ["계산된 엔진 부하 (%)", "engine_load_pct", "Engine Load (%)"],
+    "maf": ["공기 질량 유량(MAF) (g/sec)", "maf_gps", "MAF (g/sec)"],
+    "fuel_rate": ["계산된 순간 연료 소비율 (L/h)", "fuel_rate_lph"],
+    "fuel_used": ["사용 연료 (L)", "사용 연료 (오늘) (L)", "fuel_used_l"],
+    "distance": ["주행 거리 (km)", "주행 거리 (오늘) (km)", "distance_km"],
+    "lat": ["Latitude", "lat"],
+    "lon": ["Longtitude", "Longitude", "lon"],
+}
+
 
 VEHICLE_COL = {
     "brand": "브랜드",
@@ -284,6 +299,23 @@ def numeric_series(df: pd.DataFrame, column: str) -> pd.Series:
     return pd.to_numeric(df[column], errors="coerce")
 
 
+def resolve_csv_columns(df: pd.DataFrame) -> dict[str, str | None]:
+    """지원하는 로거 CSV 포맷에서 표준 의미별 실제 컬럼명을 찾는다."""
+
+    resolved: dict[str, str | None] = {}
+    for key, default_name in CSV_COL.items():
+        candidates = [default_name, *CSV_ALIASES.get(key, [])]
+        resolved[key] = next((name for name in candidates if name in df.columns), None)
+    return resolved
+
+
+def numeric_signal(df: pd.DataFrame, columns: dict[str, str | None], key: str) -> pd.Series:
+    column = columns.get(key)
+    if column is None:
+        return pd.Series(np.nan, index=df.index, dtype="float64")
+    return numeric_series(df, column)
+
+
 def mark_runs(mask: pd.Series, min_len: int) -> pd.Series:
     """True가 min_len 샘플 이상 연속된 구간만 True로 인정한다."""
 
@@ -315,14 +347,21 @@ def positive_range(series: pd.Series) -> float:
 
 
 def parse_time_seconds(time_col: pd.Series) -> pd.Series:
-    """HH:MM:SS.sss 형태의 로거 시간을 경과초로 변환한다.
+    """로거 시간을 경과초로 변환한다.
 
-    23시대에 시작해 자정을 넘는 로그도 처리하기 위해 시간이 역행하면 하루를 더한다.
+    기존 HH:MM:SS.sss 포맷과 신규 ISO timestamp 포맷을 모두 처리한다.
     """
 
-    parsed = pd.to_datetime(time_col.astype(str), format="%H:%M:%S.%f", errors="coerce")
-    fallback = pd.to_datetime(time_col.astype(str), format="%H:%M:%S", errors="coerce")
-    parsed = parsed.fillna(fallback)
+    text = time_col.astype(str)
+    parsed = pd.to_datetime(text, format="%H:%M:%S.%f", errors="coerce")
+    fallback = pd.to_datetime(text, format="%H:%M:%S", errors="coerce")
+    generic = pd.to_datetime(text, errors="coerce")
+    parsed = parsed.fillna(fallback).fillna(generic)
+    has_date = text.str.contains(r"\d{4}-\d{2}-\d{2}|T", regex=True, na=False)
+    if has_date.any():
+        first_valid = parsed.dropna().iloc[0]
+        return (parsed - first_valid).dt.total_seconds()
+
     seconds = (
         parsed.dt.hour * 3600
         + parsed.dt.minute * 60
@@ -339,25 +378,33 @@ def load_drive_timeseries(csv_path: Path) -> tuple[pd.DataFrame, dict[str, Any]]
     """원시 CSV를 센서 융합 후 1Hz 시계열로 만든다."""
 
     raw = pd.read_csv(csv_path, encoding="utf-8-sig")
-    raw["elapsed_s"] = parse_time_seconds(raw[CSV_COL["time"]])
-    raw = raw.dropna(subset=["elapsed_s"]).sort_values("elapsed_s")
+    csv_columns = resolve_csv_columns(raw)
+    if csv_columns["time"] is None:
+        raise KeyError(
+            "시간 컬럼을 찾지 못했습니다. 지원 컬럼: "
+            + ", ".join(CSV_ALIASES["time"])
+        )
 
-    speed_obd = numeric_series(raw, CSV_COL["obd_speed"])
-    speed_gps = numeric_series(raw, CSV_COL["gps_speed"])
+    raw["elapsed_s"] = parse_time_seconds(raw[csv_columns["time"]])
+    raw = raw.dropna(subset=["elapsed_s"]).sort_values("elapsed_s")
+    csv_columns = resolve_csv_columns(raw)
+
+    speed_obd = numeric_signal(raw, csv_columns, "obd_speed")
+    speed_gps = numeric_signal(raw, csv_columns, "gps_speed")
     speed = speed_obd.combine_first(speed_gps)
 
     signals = pd.DataFrame(
         {
             "speed_kmh": speed.to_numpy(),
-            "rpm": numeric_series(raw, CSV_COL["rpm"]).to_numpy(),
-            "throttle_pct": numeric_series(raw, CSV_COL["throttle"]).to_numpy(),
-            "engine_load_pct": numeric_series(raw, CSV_COL["engine_load"]).to_numpy(),
-            "maf_gps": numeric_series(raw, CSV_COL["maf"]).to_numpy(),
-            "fuel_rate_lph": numeric_series(raw, CSV_COL["fuel_rate"]).to_numpy(),
-            "fuel_used_l": numeric_series(raw, CSV_COL["fuel_used"]).to_numpy(),
-            "distance_km": numeric_series(raw, CSV_COL["distance"]).to_numpy(),
-            "lat": numeric_series(raw, CSV_COL["lat"]).to_numpy(),
-            "lon": numeric_series(raw, CSV_COL["lon"]).to_numpy(),
+            "rpm": numeric_signal(raw, csv_columns, "rpm").to_numpy(),
+            "throttle_pct": numeric_signal(raw, csv_columns, "throttle").to_numpy(),
+            "engine_load_pct": numeric_signal(raw, csv_columns, "engine_load").to_numpy(),
+            "maf_gps": numeric_signal(raw, csv_columns, "maf").to_numpy(),
+            "fuel_rate_lph": numeric_signal(raw, csv_columns, "fuel_rate").to_numpy(),
+            "fuel_used_l": numeric_signal(raw, csv_columns, "fuel_used").to_numpy(),
+            "distance_km": numeric_signal(raw, csv_columns, "distance").to_numpy(),
+            "lat": numeric_signal(raw, csv_columns, "lat").to_numpy(),
+            "lon": numeric_signal(raw, csv_columns, "lon").to_numpy(),
         },
         index=pd.to_timedelta(raw["elapsed_s"], unit="s"),
     )
@@ -393,6 +440,7 @@ def load_drive_timeseries(csv_path: Path) -> tuple[pd.DataFrame, dict[str, Any]]
         "normalized_rows_1hz": int(len(ts)),
         "raw_duration_s": finite_float(raw["elapsed_s"].max() - raw["elapsed_s"].min()),
         "csv_path": str(csv_path),
+        "csv_columns": {key: value for key, value in csv_columns.items() if value is not None},
     }
     return ts, metadata
 
@@ -522,10 +570,17 @@ def extract_drive_features(ts: pd.DataFrame) -> dict[str, Any]:
     quasi_cruise = (ts["speed_kmh"] >= 2) & (ts["accel_mps2"].abs() <= 0.3)
     required_load = 8 + ts["speed_kmh"] * 0.18 + (ts["speed_kmh"] / 100.0) ** 2 * 15
     load_deviation = (ts["engine_load_pct"] - required_load)[quasi_cruise].dropna()
-    power_load_deviation_mean = finite_float(load_deviation.mean())
-    power_load_deviation_p95 = finite_float(load_deviation.quantile(0.95))
+    if load_deviation.empty:
+        power_load_deviation_mean = np.nan
+        power_load_deviation_p95 = np.nan
+        load_status = "부하 데이터 부족"
+    else:
+        power_load_deviation_mean = finite_float(load_deviation.mean())
+        power_load_deviation_p95 = finite_float(load_deviation.quantile(0.95))
 
-    if abs(power_load_deviation_mean) <= 5:
+    if load_deviation.empty:
+        pass
+    elif abs(power_load_deviation_mean) <= 5:
         load_status = "정상 부하"
     elif power_load_deviation_mean >= 10:
         load_status = "적재량 증가/차량 상태 점검 필요"
@@ -1010,6 +1065,15 @@ def write_report(
     else:
         top_by_powertrain_table = "추천 후보가 없습니다."
 
+    def fmt_num(value: Any, suffix: str = "", precision: int = 1) -> str:
+        try:
+            number = float(value)
+        except (TypeError, ValueError):
+            return "n/a"
+        if not math.isfinite(number):
+            return "n/a"
+        return f"{number:.{precision}f}{suffix}"
+
     feature_lines = [
         f"- 주행거리: {features['daily_dist_km']:.3f} km",
         f"- 주행시간: {features['duration_s'] / 60:.1f} 분, 이동시간 비율: {features['moving_ratio']:.1%}",
@@ -1018,7 +1082,7 @@ def write_report(
         f"- 정체비율: {features['congestion_ratio']:.1%}, 정차-출발: {features['stop_go_count']}회 ({features['stop_go_per_min']:.2f}회/분)",
         f"- 급가속/급제동: {features['harsh_accel_events']}회 / {features['harsh_brake_events']}회",
         f"- 스로틀 공격성: {features['throttle_aggressiveness']:.2f} (avg {features['throttle_rate_avg']:.2f}%/s, p95 {features['throttle_rate_p95']:.2f}%/s)",
-        f"- 부하 판정: {features['load_status']} (평균 편차 {features['power_load_deviation_mean']:.1f}pp, P95 {features['power_load_deviation_p95']:.1f}pp)",
+        f"- 부하 판정: {features['load_status']} (평균 편차 {fmt_num(features['power_load_deviation_mean'], 'pp')}, P95 {fmt_num(features['power_load_deviation_p95'], 'pp')})",
         f"- 관측 연비: {features['observed_km_per_l']:.2f} km/L ({features['observed_l_per_100km']:.2f} L/100km)",
     ]
 
@@ -1086,6 +1150,49 @@ def save_outputs(
         "summary": summary_path,
         "results": result_path,
         "report": report_path,
+    }
+
+
+def run_recommendation_pipeline(
+    drive_csv_path: Path,
+    vehicle_db_path: Path = DEFAULT_VEHICLE_DB,
+    constraints: UserConstraints | None = None,
+    top_n: int = 10,
+    output_dir: Path | None = None,
+    save_artifacts: bool = False,
+) -> dict[str, Any]:
+    """API/CLI 공용 추천 실행 함수.
+
+    CSV를 읽어 주행 Feature를 추출하고 차량 DB 전체에 점수를 매긴 뒤,
+    JSON 직렬화 가능한 결과를 반환한다. ``save_artifacts``가 True이면 기존 CLI와
+    같은 JSON/CSV/Markdown 산출물도 저장한다.
+    """
+
+    active_constraints = constraints or UserConstraints()
+    ts, metadata = load_drive_timeseries(drive_csv_path)
+    features = extract_drive_features(ts)
+    vehicle_df = load_vehicle_db(vehicle_db_path)
+    recommendations = recommend_vehicles(vehicle_df, features, active_constraints)
+
+    paths: dict[str, Path] = {}
+    if save_artifacts:
+        artifact_dir = output_dir or DEFAULT_OUTPUT_DIR
+        paths = save_outputs(
+            artifact_dir,
+            metadata,
+            active_constraints,
+            features,
+            recommendations,
+        )
+
+    top = recommendations.head(top_n).replace({np.nan: None})
+    return {
+        "metadata": metadata,
+        "constraints": asdict(active_constraints),
+        "features": features,
+        "total_recommendations": int(len(recommendations)),
+        "top_recommendations": top.to_dict(orient="records"),
+        "artifacts": {name: str(path.resolve()) for name, path in paths.items()},
     }
 
 
