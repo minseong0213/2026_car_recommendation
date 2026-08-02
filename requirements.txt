@@ -4,3 +4,4 @@ openpyxl
 fastapi
 uvicorn[standard]
 python-multipart
+boto3
